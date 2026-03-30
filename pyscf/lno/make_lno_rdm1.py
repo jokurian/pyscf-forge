@@ -596,3 +596,60 @@ def subspace_eigh(fock, orb):
         moe, u = np.linalg.eigh(f)
         orb = np.dot(orb, u)
     return moe, orb
+
+def make_subspace_rdm1_occ_1h(ovL, moeocc, moevir, u):
+    if u.ndim == 1:
+        u = u[:, None]
+
+    dtype = ovL.dtype
+
+    moeOcc_loc, u = subspace_eigh(np.diag(moeocc), u)
+
+    eov = moeocc[:, None] - moevir
+    eOv = moeOcc_loc[:, None] - moevir
+
+    KvL = lib.einsum('iax,iI->Iax', ovL, u.conj())
+    eiKvv = lib.direct_sum('ia,Kb->iKab', eov, eOv)
+    t2 = np.conj(lib.einsum('iax,Kbx->iKab', ovL, KvL)) / eiKvv
+
+    nocc = moeocc.size
+
+    X = t2.reshape(nocc, -1)                    # X[i, p=(K,a,b)] = t_{iKab}
+    Y = t2.transpose(0, 1, 3, 2).reshape(nocc, -1)  # Y[i, p] = t_{iKba}
+
+    dm = -4 * (X.conj() @ X.T)
+    dm +=  2 * (X.conj() @ Y.T)
+
+    dm = 0.5 * (dm + dm.T.conj())
+    return dm
+
+def make_subspace_rdm1_vir_1h(ovL, moeocc, moevir, u):
+    if u.ndim == 1:
+        u = u[:, None]
+
+    dtype = ovL.dtype
+
+    moeOcc_loc, u = subspace_eigh(np.diag(moeocc), u)
+
+    eOv = moeOcc_loc[:, None] - moevir
+    eov = moeocc[:, None] - moevir
+
+    IvL = lib.einsum('iax,iI->Iax', ovL, u.conj())
+    eIjvv = lib.direct_sum('Ia,jb->Ijab', eOv, eov)
+    t2 = np.conj(lib.einsum('Iax,jbx->Ijab', IvL, ovL)) / eIjvv
+
+    nvir = moevir.size
+
+    # X[a, p=(I,j,c)] = t_{Ijac}
+    X = t2.transpose(2, 0, 1, 3).reshape(nvir, -1)
+
+    # Y[a, p=(I,j,c)] = t_{Ijca}
+    Y = t2.transpose(3, 0, 1, 2).reshape(nvir, -1)
+
+    dm =  2 * (X @ X.conj().T)
+    dm -=      (X @ Y.conj().T)
+    dm -=      (Y @ X.conj().T)
+    dm +=  2 * (Y @ Y.conj().T)
+
+    dm = 0.5 * (dm + dm.T.conj())
+    return dm

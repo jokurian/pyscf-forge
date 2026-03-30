@@ -41,8 +41,9 @@ from pyscf.lib import logger
 from pyscf import lib
 from pyscf import __config__
 
-from pyscf.lno.make_lno_rdm1 import make_lo_rdm1_occ, make_lo_rdm1_vir
+from pyscf.lno.make_lno_rdm1 import make_lo_rdm1_occ, make_lo_rdm1_vir, make_subspace_rdm1_occ_1h, make_subspace_rdm1_vir_1h
 from pyscf.lno import domain
+
 
 einsum = lib.einsum
 
@@ -91,6 +92,7 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
     # Loop over fragment
     frag_res = [None] * nfrag
     for ifrag,loidx in enumerate(frag_lolist):
+        mlno._current_ifrag = ifrag
         if len(loidx) == 2 and isinstance(loidx[0], Iterable): # Unrestricted
             orbloc = [lo_coeff[0][:,loidx[0]], lo_coeff[1][:,loidx[1]]]
             lno_param = [
@@ -164,6 +166,156 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
 
     return frag_res
 
+def make_las_prescreen(mlno, eris, orbloc, lno_type, lno_param):
+    log = logger.new_logger(mlno)
+    cput1 = (logger.process_clock(), logger.perf_counter())
+
+    s1e = mlno.s1e
+
+    orboccfrz_core, orbocc, orbvir, orbvirfrz_core = mlno.split_mo_coeff()
+    moeocc, moevir = mlno.split_mo_energy()[1:3]
+
+    ''' Projection of LO onto occ and vir
+    '''
+    uocc_loc = reduce(np.dot, (orbloc.T.conj(), s1e, orbocc))
+    uocc_loc, uocc_std, uocc_orth = \
+            projection_construction(uocc_loc, mlno.lo_proj_thresh, mlno.lo_proj_thresh_active)
+    if uocc_loc.shape[1] == 0:
+        log.error('LOs do not overlap with occupied space. This could be caused '
+                  'by either a bad fragment choice or too high of `lo_proj_thresh_active` '
+                  '(current value: %s).', mlno.lo_proj_thresh_active)
+        raise RuntimeError
+    uocc_orth_full = uocc_orth
+    log.info('LO occ proj: %d active | %d standby | %d orthogonal',
+             *[u.shape[1] for u in [uocc_loc,uocc_std,uocc_orth]])
+
+    uvir_loc = reduce(np.dot, (orbloc.T.conj(), s1e, orbvir))
+    uvir_loc, uvir_std, uvir_orth = \
+            projection_construction(uvir_loc, mlno.lo_proj_thresh, mlno.lo_proj_thresh_active)
+    uvir_orth_full = uvir_orth
+    
+    log.info('LO vir proj: %d active | %d standby | %d orthogonal',
+             *[u.shape[1] for u in [uvir_loc,uvir_std,uvir_orth]])
+
+    frag_prescreen = mlno.get_dlno_prescreen_fragment()
+    if frag_prescreen is None:
+        raise RuntimeError('make_las_test assumes DLNO prescreening data is available. '
+                           'Set use_dlno_prescreen=True and provide dlno_prescreen_data.')
+    if lno_type[0] != '1h' or lno_type[1] != '1h':
+        raise NotImplementedError('make_las_test currently assumes lno_type == ["1h", "1h"].')
+
+    uocc_dlno = mlno.get_dlno_prescreen_space(
+        orbocc, frag_prescreen, 'occ_prescreen_coeff',
+        anchor_spaces=(uocc_loc, uocc_std), s1e=s1e)
+    if uocc_dlno is None or uocc_dlno.shape[1] == 0:
+        raise RuntimeError('DLNO occupied prescreen space is empty for this fragment.')
+    log.info('DLNO occ prescreen: %d -> %d candidate directions',
+             uocc_orth.shape[1], uocc_dlno.shape[1])
+    uocc_orth = uocc_dlno
+    uocc_outside = orthonormalize_colspace(
+        uocc_orth_full - np.dot(uocc_orth, np.dot(uocc_orth.T.conj(), uocc_orth_full)),
+        thresh=mlno.lo_proj_thresh)
+
+    uocc_dom_space = mlno.get_dlno_prescreen_space(
+        orbocc, frag_prescreen, 'occ_prescreen_coeff',
+        anchor_spaces=(), s1e=s1e)
+    if uocc_dom_space is None or uocc_dom_space.shape[1] == 0:
+        raise RuntimeError('DLNO occupied domain space is empty for this fragment.')
+
+    uvir_dlno = mlno.get_dlno_prescreen_space(
+        orbvir, frag_prescreen, 'vir_prescreen_coeff',
+        anchor_spaces=(uvir_loc, uvir_std), s1e=s1e)
+    if uvir_dlno is None or uvir_dlno.shape[1] == 0:
+        raise RuntimeError('DLNO virtual prescreen space is empty for this fragment.')
+    log.info('DLNO vir prescreen: %d -> %d candidate directions',
+             orbvir.shape[1], uvir_dlno.shape[1])
+    uvir_orth = uvir_dlno
+    uvir_outside = orthonormalize_colspace(
+        uvir_orth_full - np.dot(uvir_orth, np.dot(uvir_orth.T.conj(), uvir_orth_full)),
+        thresh=mlno.lo_proj_thresh)
+
+    uvir_dom_space = mlno.get_dlno_prescreen_space(
+        orbvir, frag_prescreen, 'vir_prescreen_coeff',
+        anchor_spaces=(), s1e=s1e)
+    if uvir_dom_space is None or uvir_dom_space.shape[1] == 0:
+        raise RuntimeError('DLNO virtual domain space is empty for this fragment.')
+
+    ''' LNO construction
+    '''
+    moeocc_dom, uocc_dom = subspace_eigh(np.diag(moeocc), uocc_dom_space)
+    moevir_dom, uvir_dom = subspace_eigh(np.diag(moevir), uvir_dom_space)
+    uocc_loc_dom = np.dot(uocc_dom.T.conj(), uocc_loc)
+
+    ovL_dom = eris.xform_occ(uocc_dom)
+    ovL_dom = lib.einsum('Iax,aA->IAx', ovL_dom, uvir_dom)
+    dmoo_dom = make_subspace_rdm1_occ_1h(
+        ovL_dom, moeocc_dom, moevir_dom, uocc_loc_dom
+    )
+    dmvv_dom = make_subspace_rdm1_vir_1h(
+        ovL_dom, moeocc_dom, moevir_dom, uocc_loc_dom
+    )
+    t_occ = np.dot(uocc_dom.T.conj(), uocc_orth)
+    t_vir = np.dot(uvir_dom.T.conj(), uvir_orth)
+    dmoo = reduce(np.dot, (t_occ.T.conj(), dmoo_dom, t_occ))
+    dmvv = reduce(np.dot, (t_vir.T.conj(), dmvv_dom, t_vir))
+    uocc_rdm_space = uocc_orth
+    uvir_rdm_space = uvir_orth
+    log.info('DLNO subspace rdm1: %d occ x %d vir',
+             uocc_dom.shape[1], uvir_dom.shape[1])
+    if mlno._match_oldcode: dmoo *= 0.5 # TO MATCH OLD LNO CODE
+
+    if lno_param[0]['norb'] is not None:
+        lno_param[0]['norb'] -= uocc_loc.shape[1] + uocc_std.shape[1]
+    uoccact_orth, uoccfrz_orth = natorb_select(dmoo, uocc_rdm_space, **lno_param[0])
+    orboccfrz = stack_colspaces(
+        orboccfrz_core,
+        np.dot(orbocc, uocc_outside),
+        np.dot(orbocc, uoccfrz_orth),
+    )
+    uocc_keep = stack_colspaces(uoccact_orth, uocc_std, uocc_loc)
+    uoccact = subspace_eigh(np.diag(moeocc), uocc_keep)[1]
+    orboccact = np.dot(orbocc, uoccact)
+    uoccact_loc = np.linalg.multi_dot((orboccact.T.conj(), s1e, orbloc))
+    cput1 = log.timer_debug1('make_lo_rdm1_occ', *cput1)
+
+    if mlno._match_oldcode:
+        dmvv *= 0.5 # TO MATCH OLD LNO CODE
+    if lno_param[1]['norb'] is not None:
+        nloc = 0 if uvir_loc is None else uvir_loc.shape[1]
+        nstd = 0 if uvir_std is None else uvir_std.shape[1]
+        lno_param[1]['norb'] -= nloc + nstd
+    uviract_orth, uvirfrz_orth = natorb_select(dmvv, uvir_rdm_space, **lno_param[1])
+    orbvirfrz = stack_colspaces(
+        np.dot(orbvir, uvir_outside),
+        np.dot(orbvir, uvirfrz_orth),
+        orbvirfrz_core,
+    )
+    uvir_keep = stack_colspaces(uviract_orth, uvir_std, uvir_loc)
+    uviract = subspace_eigh(np.diag(moevir), uvir_keep)[1]
+    orbviract = np.dot(orbvir, uviract)
+    cput1 = log.timer_debug1('make_lo_rdm1_vir', *cput1)
+
+    ''' LAS construction
+    '''
+    orbfragall = [orboccfrz, orboccact, orbviract, orbvirfrz]
+    orbfrag = np.hstack(orbfragall)
+    norbfragall = np.asarray([x.shape[1] for x in orbfragall])
+    locfragall = np.cumsum([0] + norbfragall.tolist()).astype(int)
+    frzfrag = np.concatenate((
+        np.arange(locfragall[0], locfragall[1]),
+        np.arange(locfragall[3], locfragall[4]))).astype(int)
+    frag_msg = '%d/%d Occ | %d/%d Vir | %d/%d MOs' % (
+                    norbfragall[1], sum(norbfragall[:2]),
+                    norbfragall[2], sum(norbfragall[2:4]),
+                    sum(norbfragall[1:3]), sum(norbfragall)
+                )
+    mo_occ_frag = np.zeros(sum(norbfragall), dtype=np.int32)
+    mo_occ_frag[:sum(norbfragall[:2])] = 2
+    mlno._current_fragment_mo_occ = mo_occ_frag
+    if len(frzfrag) == 0:
+        frzfrag = 0
+
+    return orbfrag, frzfrag, uoccact_loc, frag_msg
 
 def make_las(mlno, eris, orbloc, lno_type, lno_param):
     log = logger.new_logger(mlno)
@@ -264,6 +416,25 @@ def projection_construction(M, thresh, thresh_act=None):
     mask_std = np.logical_and(abs(e) > thresh, ~mask_act)
     mask_frz = abs(e) <= thresh
     return u[:,mask_act], u[:,mask_std], u[:,mask_frz]
+
+def stack_colspaces(*spaces):
+    all_spaces = [x for x in spaces if x is not None]
+    if not all_spaces:
+        return np.zeros((0,0))
+    spaces = [x for x in all_spaces if x.shape[1] > 0]
+    if not spaces:
+        return np.zeros((all_spaces[0].shape[0],0))
+    return np.hstack(spaces)
+
+def orthonormalize_colspace(A, thresh=1e-10):
+    if A.size == 0:
+        return np.zeros((A.shape[0],0), dtype=A.dtype)
+    M = np.dot(A.T.conj(), A)
+    e, u = np.linalg.eigh(M)
+    mask = abs(e) > thresh
+    if not np.any(mask):
+        return np.zeros((A.shape[0],0), dtype=A.dtype)
+    return np.dot(A, u[:,mask] / np.sqrt(e[mask]))
 
 def subspace_eigh(fock, orb):
     f = reduce(np.dot, (orb.T.conj(), fock, orb))
@@ -372,6 +543,10 @@ class LNO(lib.StreamObject):
         self.prune_lno_basis = False  # whether or not to use domains
         self.lno_basis_thresh = 0.02  # default Boughton-Pulay parameter
 
+        # DLNO prescreening parameters
+        self.use_dlno_prescreen = False
+        self.dlno_prescreen_data = None
+
         # df eri
         self._ovL = None
         self._ovL_to_save = None
@@ -388,6 +563,9 @@ class LNO(lib.StreamObject):
         self._mo_occ = None
         self._mo_coeff = None
         self._mo_energy = None
+
+        self._current_ifrag = None
+        self.make_las_variant = None
 
     @property
     def nfrag(self):
@@ -452,6 +630,9 @@ class LNO(lib.StreamObject):
         log.info('lo_proj_thresh = %s', self.lo_proj_thresh)
         log.info('lo_proj_thresh_active = %s', self.lo_proj_thresh_active)
         log.info('verbose_imp = %s', self.verbose_imp)
+        log.info('use_dlno_prescreen = %s', self.use_dlno_prescreen)
+        log.info('dlno_prescreen_data = %s', type(self.dlno_prescreen_data).__name__
+                 if self.dlno_prescreen_data is not None else None)
         log.info('_ovL = %s', self._ovL)
         log.info('_ovL_to_save = %s', self._ovL_to_save)
         log.info('force_outcore_ao2mo = %s', self.force_outcore_ao2mo)
@@ -541,6 +722,47 @@ class LNO(lib.StreamObject):
     def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
         return make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type)
 
+    def get_dlno_prescreen_fragment(self, ifrag=None):
+        if not self.use_dlno_prescreen:
+            return None
+        data = self.dlno_prescreen_data
+        if data is None:
+            return None
+        if ifrag is None:
+            ifrag = self._current_ifrag
+        if ifrag is None:
+            return None
+        frag_data = data.get('fragment_data')
+        if frag_data is None or ifrag >= len(frag_data):
+            return None
+        return frag_data[ifrag]
+
+    def get_dlno_prescreen_space(self, orb, frag_data, key, anchor_spaces=(), s1e=None):
+        if frag_data is None or key not in frag_data:
+            return None
+        coeff = np.asarray(frag_data[key])
+        if coeff.ndim != 2:
+            return None
+        atmlst = frag_data.get('extended_primary_domain')
+        if atmlst is None:
+            return None
+        atmlst = np.asarray(atmlst, dtype=np.int32)
+        if atmlst.size == 0:
+            return np.zeros((orb.shape[1],0), dtype=orb.dtype)
+        ao_idx = domain.ao_index_by_atom(self.mol, atmlst)
+        if coeff.shape[0] != len(ao_idx):
+            raise ValueError('DLNO prescreen data has incompatible AO dimension for fragment '
+                             f'{self._current_ifrag}: expected {len(ao_idx)}, got {coeff.shape[0]}')
+        if s1e is None:
+            s1e = self.s1e
+        coeff_full = np.zeros((self.mol.nao, coeff.shape[1]), dtype=coeff.dtype)
+        coeff_full[ao_idx] = coeff
+        u = reduce(np.dot, (orb.T.conj(), s1e, coeff_full))
+        anchor = stack_colspaces(*anchor_spaces)
+        if anchor.size > 0:
+            u = u - np.dot(anchor, np.dot(anchor.T.conj(), u))
+        return orthonormalize_colspace(u, thresh=self.lo_proj_thresh)
+
     def _precompute(self, *args, **kwargs):
         pass
 
@@ -551,6 +773,31 @@ class LNO(lib.StreamObject):
     split_mo_energy = mp.dfmp2.DFMP2.split_mo_energy
     split_mo_occ = mp.dfmp2.DFMP2.split_mo_occ
     make_las = make_las
+
+    def _get_make_las(self):
+        if callable(self.make_las_variant):
+            return self.make_las_variant
+
+        if self.make_las_variant is None and self.use_dlno_prescreen==False:
+            self.make_las_variant = "default"
+        elif self.make_las_variant is None and self.use_dlno_prescreen==True:
+            self.make_las_variant = "make_las_prescreen"
+
+        variants = {
+            'default': make_las,
+            'make_las': make_las,
+            'make_las_prescreen': make_las_prescreen,
+        }
+        try:
+            return variants[self.make_las_variant]
+        except KeyError as err:
+            raise ValueError(
+                f'Unknown make_las_variant {self.make_las_variant!r}. '
+                "Use 'make_las', 'make_las_prescreen', or a callable."
+            ) from err
+
+    def make_las(self, eris, orbloc, lno_type, lno_param):
+        return self._get_make_las()(self, eris, orbloc, lno_type, lno_param)
 
     @property
     def nocc(self):
