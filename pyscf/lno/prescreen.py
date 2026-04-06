@@ -1,6 +1,6 @@
 from functools import reduce
 import numpy as np
-from pyscf import gto, lo, scf
+from pyscf import gto, lo, scf,mp,lib
 from pyscf.data.elements import chemcore
 
 from dlno import dlno as dlno_mod
@@ -85,7 +85,6 @@ def build_dlno_prescreen_data(
     extended_primary_domain = [
         union_objects([lmo_primary_domain[j] for j in idx]) for idx in strong_pairs
     ]
-
     fragment_data = []
     for ifrag, loidx in enumerate(frag_lolist):
         loidx = np.asarray(loidx, dtype=np.int32)
@@ -184,4 +183,44 @@ def print_summary(data):
         print(f"  Occ prescreen size            : {frag['occ_prescreen_coeff'].shape[1]}")
         print(f"  Vir prescreen size            : {frag['vir_prescreen_coeff'].shape[1]}")
         print()
+
+
+def load_or_run_scf(mf, chkfile, cderi_file=None):
+    mf.chkfile = str(chkfile)
+    if cderi_file is not None and getattr(mf, "with_df", None) is not None:
+        mf.with_df._cderi_to_save = str(cderi_file)
+        if cderi_file.exists():
+            mf.with_df._cderi = str(cderi_file)
+    if chkfile.exists():
+        print(f"Loading SCF checkpoint from {chkfile}")
+        mf.__dict__.update(lib.chkfile.load(str(chkfile), "scf"))
+        mf.converged = True
+    else:
+        print(f"Running SCF and saving checkpoint to {chkfile}")
+        mf.kernel()
+    return mf
+
+
+def load_or_localize_pm(mol, orbocc, lo_coeff_file):
+    if lo_coeff_file.exists():
+        print(f"Loading localized orbitals from {lo_coeff_file}")
+        return np.load(lo_coeff_file, allow_pickle=False)
+
+    print(f"Running Pipek-Mezey localization and saving to {lo_coeff_file}")
+    lo_coeff = lo.PipekMezey(mol, orbocc).kernel()
+    np.save(lo_coeff_file, lo_coeff)
+    return lo_coeff
+
+
+def load_or_run_mp2(mf, frozen, mp2_ecorr_file):
+    if mp2_ecorr_file.exists():
+        print(f"Loading MP2 correlation energy from {mp2_ecorr_file}")
+        return float(np.load(mp2_ecorr_file, allow_pickle=False))
+
+    print(f"Running MP2 and saving correlation energy to {mp2_ecorr_file}")
+    mmp = mp.MP2(mf, frozen=frozen)
+    mmp.kernel(with_t2=False)
+    e_corr = float(mmp.e_corr)
+    np.save(mp2_ecorr_file, np.asarray(e_corr))
+    return e_corr
 
