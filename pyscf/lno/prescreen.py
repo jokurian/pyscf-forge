@@ -201,26 +201,37 @@ def load_or_run_scf(mf, chkfile, cderi_file=None):
     return mf
 
 
-def load_or_localize_pm(mol, orbocc, lo_coeff_file):
+def load_or_localize_pm(mol, orbocc, lo_coeff_file, localize=None):
     if lo_coeff_file.exists():
         print(f"Loading localized orbitals from {lo_coeff_file}")
         return np.load(lo_coeff_file, allow_pickle=False)
 
     print(f"Running Pipek-Mezey localization and saving to {lo_coeff_file}")
-    lo_coeff = lo.PipekMezey(mol, orbocc).kernel()
+    if localize is None:
+        lo_coeff = lo.PipekMezey(mol, orbocc).kernel()
+    else:
+        lo_coeff = localize(mol, orbocc)
     np.save(lo_coeff_file, lo_coeff)
     return lo_coeff
 
 
-def load_or_run_mp2(mf, frozen, mp2_ecorr_file):
+def load_or_run_mp2(mf, frozen, mp2_ecorr_file, mp2_factory=None, kernel_kwargs=None):
     if mp2_ecorr_file.exists():
         print(f"Loading MP2 correlation energy from {mp2_ecorr_file}")
         return float(np.load(mp2_ecorr_file, allow_pickle=False))
 
     print(f"Running MP2 and saving correlation energy to {mp2_ecorr_file}")
-    mmp = mp.MP2(mf, frozen=frozen)
-    mmp.kernel(with_t2=False)
+    if mp2_factory is None:
+        mmp = mp.MP2(mf, frozen=frozen)
+    else:
+        mmp = mp2_factory(mf, frozen)
+    if kernel_kwargs is None:
+        kernel_kwargs = {}
+    else:
+        kernel_kwargs = dict(kernel_kwargs)
+    if mp2_factory is None and "with_t2" not in kernel_kwargs:
+        kernel_kwargs["with_t2"] = False
+    mmp.kernel(**kernel_kwargs)
     e_corr = float(mmp.e_corr)
     np.save(mp2_ecorr_file, np.asarray(e_corr))
     return e_corr
-
