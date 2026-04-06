@@ -31,21 +31,20 @@ atom = water_chain_atom(n_waters=n_waters, d=8.0)
 # atom = "water_21.xyz"
 # n_waters = 21
 basis = "cc-pvdz"
-basis_tag = "".join(ch if ch.isalnum() else "_" for ch in basis)
 
 mol = gto.M(atom=atom, basis=basis, verbose=4, max_memory=8000)
 mf = scf.RHF(mol).density_fit()
 mf.chkfile = f"scf_{n_waters}.chk"
 mf.init_guess = "chk"
 # mf.kernel()
-df_file = Path(f"df_ints_{n_waters}_{basis_tag}.h5")
+df_file = Path(f"df_ints_{n_waters}_{basis}.h5")
 mf = load_or_run_scf(mf, Path(mf.chkfile), cderi_file=df_file)
 frozen = chemcore(mol)
 
 mmp_e_corr = load_or_run_mp2(
     mf,
     frozen=frozen,
-    mp2_ecorr_file=Path(f"mp2_ecorr_{n_waters}_{basis_tag}.npy"),
+    mp2_ecorr_file=Path(f"mp2_ecorr_{n_waters}_{basis}.npy"),
 )
 
 
@@ -53,7 +52,7 @@ orbocc = mf.mo_coeff[:, frozen : np.count_nonzero(mf.mo_occ)]
 lo_coeff = load_or_localize_pm(
     mol,
     orbocc,
-    Path(f"lo_coeff_{n_waters}_{basis_tag}.npy"),
+    Path(f"lo_coeff_{n_waters}_{basis}.npy"),
 )
 frag_lolist = [[i] for i in range(lo_coeff.shape[1])]
 
